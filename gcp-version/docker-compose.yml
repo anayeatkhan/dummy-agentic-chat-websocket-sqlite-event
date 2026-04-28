@@ -1,0 +1,131 @@
+##############################################################################
+# docker-compose.yml  —  Local development stack
+#
+# Starts real local equivalents of all GCP services:
+#   pubsub-emulator  →  GCP Pub/Sub
+#   postgres         →  Cloud SQL (PostgreSQL 15)
+#   redis            →  Cloud Memorystore (Redis 7)
+#   agent_service    →  Cloud Run service on :8001
+#   chat_service     →  Cloud Run service on :8002
+#
+# Usage:
+#   docker compose up --build
+#
+# The PUBSUB_EMULATOR_HOST env var tells google-cloud-pubsub to connect to
+# the local emulator instead of real GCP — no code change required.
+##############################################################################
+
+version: "3.9"
+
+services:
+
+  # ── GCP Pub/Sub emulator ───────────────────────────────────────────────────
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+    command: >
+      gcloud beta emulators pubsub start
+      --project=local-project
+      --host-port=0.0.0.0:8085
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── PostgreSQL (Cloud SQL) ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     chatuser
+      POSTGRES_PASSWORD: chatpass
+      POSTGRES_DB:       chatdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-runs schema.sql on first boot
+      - ./infra/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatuser -d chatdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Redis (Cloud Memorystore) ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Pub/Sub topic + subscription bootstrap ────────────────────────────────
+  # Runs once after the emulator is healthy, then exits.
+  pubsub-setup:
+    build:
+      context: .
+      dockerfile: agent_service/Dockerfile
+    command: python infra/setup_pubsub.py
+    environment:
+      GCP_PROJECT_ID:       local-project
+      PUBSUB_TOPIC_ID:      chat-events
+      PUBSUB_SUBSCRIPTION_ID: chat-events-sub
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+    depends_on:
+      pubsub-emulator:
+        condition: service_healthy
+
+  # ── agent_service ──────────────────────────────────────────────────────────
+  agent_service:
+    build:
+      context: .
+      dockerfile: agent_service/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      PORT:                 8001
+      GCP_PROJECT_ID:       local-project
+      PUBSUB_TOPIC_ID:      chat-events
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      REDIS_URL:            redis://redis:6379
+      STREAM_BUFFER_TTL:    300
+    depends_on:
+      pubsub-emulator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub-setup:
+        condition: service_completed_successfully
+
+  # ── chat_service ───────────────────────────────────────────────────────────
+  chat_service:
+    build:
+      context: .
+      dockerfile: chat_service/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      PORT:                    8002
+      GCP_PROJECT_ID:          local-project
+      PUBSUB_SUBSCRIPTION_ID:  chat-events-sub
+      PUBSUB_EMULATOR_HOST:    pubsub-emulator:8085
+      DATABASE_URL:            postgresql://chatuser:chatpass@postgres:5432/chatdb
+      REDIS_URL:               redis://redis:6379
+      STREAM_BUFFER_TTL:       300
+    depends_on:
+      pubsub-emulator:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub-setup:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
